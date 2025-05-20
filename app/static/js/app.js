@@ -26,8 +26,8 @@ const recordingContainer = document.getElementById("recording-container");
 
 // WebSocket handlers
 function connectWebsocket() {
-  // Connect websocket
-  const wsUrl = ws_url + "?is_audio=" + is_audio;
+  // Connect websocket with API key for authentication
+  const wsUrl = ws_url + "?is_audio=" + is_audio + "&api_key=secure-dev-api-key";
   websocket = new WebSocket(wsUrl);
 
   // Handle connection open

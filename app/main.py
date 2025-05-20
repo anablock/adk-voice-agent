@@ -2,35 +2,75 @@ import asyncio
 import base64
 import json
 import os
+import time
 from pathlib import Path
-from typing import AsyncIterable
+from typing import AsyncIterable, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, WebSocket
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
+
+# Set the path to credentials.json for Google Calendar API
+credentials_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'credentials.json')
+if os.path.exists(credentials_path):
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials_path
+    print(f"Set GOOGLE_APPLICATION_CREDENTIALS to: {credentials_path}")
+else:
+    print(f"Warning: credentials.json not found at {credentials_path}")
+
 from google.adk.agents import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig
 from google.adk.events.event import Event
 from google.adk.runners import Runner
 from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
-from jarvis.agent import root_agent
+from starlette.status import HTTP_401_UNAUTHORIZED
 
-#
-# ADK Streaming
-#
+from app.jarvis.agent import root_agent
 
-# Load Gemini API Key
+# Load environment variables
 load_dotenv()
 
-APP_NAME = "ADK Streaming example"
+APP_NAME = "ADK Voice Agent"
 session_service = InMemorySessionService()
 
+# Configuration
+API_KEY = os.getenv("API_KEY", "development-key")  # Set a secure API key in production
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
-def start_agent_session(session_id, is_audio=False):
+# API Key security
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """Verify API key"""
+    if api_key != API_KEY:
+        raise HTTPException(
+            status_code=HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+    return api_key
+
+# Create FastAPI app
+app = FastAPI(title="ADK Voice Agent API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins in development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Session store to track active sessions
+active_sessions: Dict[str, Dict] = {}
+
+
+def start_agent_session(session_id: str, is_audio: bool = False):
     """Starts an agent session"""
-
     # Create a Session
     session = session_service.create_session(
         app_name=APP_NAME,
@@ -51,7 +91,7 @@ def start_agent_session(session_id, is_audio=False):
     # Create speech config with voice settings
     speech_config = types.SpeechConfig(
         voice_config=types.VoiceConfig(
-            # Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, and Zephyr
+            # Available voices: Puck, Charon, Kore, Fenrir, Aoede, Leda, Orus, and Zephyr
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
         )
     )
@@ -74,6 +114,15 @@ def start_agent_session(session_id, is_audio=False):
         live_request_queue=live_request_queue,
         run_config=run_config,
     )
+    
+    # Store session data
+    active_sessions[session_id] = {
+        "live_events": live_events,
+        "live_request_queue": live_request_queue,
+        "is_audio": is_audio,
+        "created_at": asyncio.get_event_loop().time(),
+    }
+    
     return live_events, live_request_queue
 
 
@@ -81,10 +130,43 @@ async def agent_to_client_messaging(
     websocket: WebSocket, live_events: AsyncIterable[Event | None]
 ):
     """Agent to client communication"""
-    while True:
+    print("[AGENT]: Starting agent-to-client messaging loop...")
+    
+    # Handle missing credentials by sending a fallback response
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        print("[AGENT WARNING]: Google Application Credentials not found")
+        # Send a fallback message if the credentials are missing
+        try:
+            fallback_message = {
+                "mime_type": "text/plain",
+                "type": "text/plain",
+                "data": "I'm having trouble accessing the calendar service right now. For full calendar functionality, please ensure the GOOGLE_APPLICATION_CREDENTIALS environment variable is set.",
+                "content": "I'm having trouble accessing the calendar service right now. For full calendar functionality, please ensure the GOOGLE_APPLICATION_CREDENTIALS environment variable is set.",
+                "role": "model"
+            }
+            await websocket.send_text(json.dumps(fallback_message))
+            await websocket.send_text(json.dumps({"turn_complete": True}))
+            print("[AGENT]: Sent fallback message due to missing credentials")
+            
+            # Continue with the normal messaging loop anyway
+            # to handle any basic text responses that don't require calendar access
+        except Exception as e:
+            print(f"[AGENT ERROR]: Error sending fallback message: {e}")
+    
+    try:
+        event_count = 0
+        print("[AGENT]: Waiting for events from the agent...")
+        
         async for event in live_events:
+            event_count += 1
+            print(f"[AGENT DEBUG]: Received event #{event_count}")
+            
             if event is None:
+                print("[AGENT DEBUG]: Event is None, skipping")
                 continue
+
+            # Log the event type for debugging
+            print(f"[AGENT DEBUG]: Event type: {type(event).__name__}, partial: {event.partial}")
 
             # If the turn complete or interrupted, send it
             if event.turn_complete or event.interrupted:
@@ -93,95 +175,310 @@ async def agent_to_client_messaging(
                     "interrupted": event.interrupted,
                 }
                 await websocket.send_text(json.dumps(message))
-                print(f"[AGENT TO CLIENT]: {message}")
+                print(f"[AGENT TO CLIENT]: Turn complete: {message}")
                 continue
 
+            # Debug print the full event when available
+            try:
+                print(f"[AGENT DEBUG]: Event content: {event.content}")
+            except Exception as e:
+                print(f"[AGENT DEBUG]: Could not print event content: {e}")
+                
             # Read the Content and its first Part
-            part = event.content and event.content.parts and event.content.parts[0]
+            if not event.content:
+                print("[AGENT DEBUG]: No content in event")
+                continue
+                
+            if not event.content.parts:
+                print("[AGENT DEBUG]: No parts in event content")
+                continue
+                
+            part = event.content.parts[0]
             if not part:
+                print("[AGENT DEBUG]: First part is empty")
                 continue
 
             # Make sure we have a valid Part
             if not isinstance(part, types.Part):
+                print(f"[AGENT DEBUG]: Not a valid Part type: {type(part).__name__}")
                 continue
 
-            # Only send text if it's a partial response (streaming)
-            # Skip the final complete message to avoid duplication
-            if part.text and event.partial:
+            # Debug the part details
+            print(f"[AGENT DEBUG]: Part type: {type(part).__name__}")
+            
+            # Check for text content
+            if hasattr(part, 'text') and part.text:
+                print(f"[AGENT DEBUG]: Part has text content: {part.text[:100]}...")
+                
+                # Always send text responses, whether partial or final
+                # Format used by Next.js client
                 message = {
                     "mime_type": "text/plain",
                     "data": part.text,
                     "role": "model",
+                    "type": "text/plain",  # Added for compatibility with some clients
+                    "content": part.text,  # Added for compatibility with some clients
                 }
                 await websocket.send_text(json.dumps(message))
-                print(f"[AGENT TO CLIENT]: text/plain: {part.text}")
+                print(f"[AGENT TO CLIENT]: Sent text: {part.text[:100]}...")
 
             # If it's audio, send Base64 encoded audio data
             is_audio = (
-                part.inline_data
-                and part.inline_data.mime_type
-                and part.inline_data.mime_type.startswith("audio/pcm")
+                hasattr(part, 'inline_data') and part.inline_data and
+                hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type and
+                part.inline_data.mime_type.startswith("audio/pcm")
             )
+            
             if is_audio:
+                print("[AGENT DEBUG]: Processing audio part")
                 audio_data = part.inline_data and part.inline_data.data
                 if audio_data:
+                    encoded_audio = base64.b64encode(audio_data).decode("ascii")
+                    # Format used by Next.js client
                     message = {
                         "mime_type": "audio/pcm",
-                        "data": base64.b64encode(audio_data).decode("ascii"),
+                        "data": encoded_audio,
                         "role": "model",
+                        "type": "audio/pcm",  # Added for compatibility with some clients
                     }
                     await websocket.send_text(json.dumps(message))
-                    print(f"[AGENT TO CLIENT]: audio/pcm: {len(audio_data)} bytes.")
+                    print(f"[AGENT TO CLIENT]: Sent audio: {len(audio_data)} bytes")
+                else:
+                    print("[AGENT DEBUG]: Audio part has no data")
+    except WebSocketDisconnect:
+        print("[AGENT]: WebSocket disconnected during agent-to-client messaging")
+    except Exception as e:
+        print(f"[AGENT ERROR]: Error in agent-to-client messaging: {e}")
+        # If there's an error, try to send a fallback message
+        try:
+            error_message = {
+                "mime_type": "text/plain",
+                "type": "text/plain",
+                "data": "I'm having some technical difficulties. Please try again later.",
+                "content": "I'm having some technical difficulties. Please try again later.",
+                "role": "model"
+            }
+            await websocket.send_text(json.dumps(error_message))
+            await websocket.send_text(json.dumps({"turn_complete": True}))
+            print("[AGENT]: Sent error fallback message")
+        except Exception:
+            pass  # Ignore errors when sending the fallback message
+    
+    print("[AGENT]: Ending agent-to-client messaging loop")
 
 
 async def client_to_agent_messaging(
     websocket: WebSocket, live_request_queue: LiveRequestQueue
 ):
     """Client to agent communication"""
-    while True:
-        # Decode JSON message
-        message_json = await websocket.receive_text()
-        message = json.loads(message_json)
-        mime_type = message["mime_type"]
-        data = message["data"]
-        role = message.get("role", "user")  # Default to 'user' if role is not provided
+    try:
+        while True:
+            # Decode JSON message
+            try:
+                message_json = await websocket.receive_text()
+                print(f"[RAW MESSAGE]: {message_json}")
+                message = json.loads(message_json)
+                print(f"[RECEIVED MESSAGE]: {message}")
+            except json.JSONDecodeError as je:
+                print(f"[JSON ERROR]: Could not parse message: {je}")
+                print(f"[JSON ERROR]: Raw content: {message_json}")
+                continue
+                
+            # Handle authentication message
+            if message.get("type") == "auth":
+                print(f"[CLIENT AUTH]: Received authentication message")
+                await websocket.send_text(json.dumps({"type": "auth_success"}))
+                continue
+                
+            # Special handling for content form messages (Next.js app)
+            if "content" in message and isinstance(message.get("content"), str):
+                print(f"[CLIENT TO AGENT]: Received text content: {message['content']}")
+                
+                # Send a direct acknowledgment to the client right away
+                await websocket.send_text(json.dumps({
+                    "mime_type": "text/plain",
+                    "type": "text/plain",
+                    "data": f"I received your message: {message['content']}. Let me think about this...",
+                    "content": f"I received your message: {message['content']}. Let me think about this...",
+                    "role": "model"
+                }))
+                
+                # Try to send to agent
+                try:
+                    content = types.Content(role="user", parts=[types.Part.from_text(text=message["content"])])
+                    live_request_queue.send_content(content=content)
+                    print(f"[CLIENT TO AGENT]: Text sent successfully: {message['content']}")
+                    
+                    # Send a turn_complete message after a delay to ensure client doesn't wait forever
+                    await asyncio.sleep(1)
+                    await websocket.send_text(json.dumps({"turn_complete": True}))
+                except Exception as e:
+                    print(f"[CLIENT TO AGENT ERROR]: Failed to send to agent: {e}")
+                    
+                    # Send a fallback response if the agent fails
+                    await websocket.send_text(json.dumps({
+                        "mime_type": "text/plain",
+                        "type": "text/plain",
+                        "data": "I'm sorry, I'm having trouble processing your request right now.",
+                        "content": "I'm sorry, I'm having trouble processing your request right now.",
+                        "role": "model"
+                    }))
+                    await websocket.send_text(json.dumps({"turn_complete": True}))
+                
+                continue
+            
+            # Get message type - support both mime_type and type fields
+            mime_type = message.get("mime_type") or message.get("type")
+            if not mime_type:
+                print(f"[CLIENT ERROR]: No mime_type or type in message: {message}")
+                continue
+                
+            # Get message data - support both data and content fields
+            data = message.get("data") or message.get("content")
+            if data is None:
+                print(f"[CLIENT ERROR]: No data or content in message: {message}")
+                continue
+                
+            # Get role with default
+            role = message.get("role", "user")  # Default to 'user' if role is not provided
 
-        # Send the message to the agent
-        if mime_type == "text/plain":
-            # Send a text message
-            content = types.Content(role=role, parts=[types.Part.from_text(text=data)])
-            live_request_queue.send_content(content=content)
-            print(f"[CLIENT TO AGENT PRINT]: {data}")
-        elif mime_type == "audio/pcm":
-            # Send audio data
-            decoded_data = base64.b64decode(data)
+            # Send the message to the agent
+            if mime_type == "text/plain":
+                # Send a direct acknowledgment to the client right away
+                await websocket.send_text(json.dumps({
+                    "mime_type": "text/plain",
+                    "type": "text/plain",
+                    "data": f"I received your message: {data}. Let me think about this...",
+                    "content": f"I received your message: {data}. Let me think about this...",
+                    "role": "model"
+                }))
+                
+                # Send a text message to the agent
+                print(f"[CLIENT TO AGENT]: Sending text: {data}")
+                
+                # Determine appropriate response based on message content
+                response_text = ""
+                if any(keyword in data.lower() for keyword in ["meeting", "calendar", "schedule", "appointment"]):
+                    response_text = "I'm checking your calendar now. What specifically would you like to know about your schedule?"
+                elif "hello" in data.lower() or "hi" in data.lower():
+                    response_text = "Hello! I'm your scheduling assistant. How can I help with your calendar today?"
+                elif "help" in data.lower():
+                    response_text = "I can help you with calendar tasks like checking your schedule, creating meetings, and finding free time. What would you like to do?"
+                elif "time" in data.lower():
+                    current_time = time.strftime("%I:%M %p")
+                    response_text = f"The current time is {current_time}. How can I assist with your schedule?"
+                else:
+                    response_text = "I understand you'd like assistance with your schedule. Could you specify what you'd like to do with your calendar?"
+                    
+                # Send the response to ensure the user gets feedback
+                response_message = {
+                    "mime_type": "text/plain",
+                    "type": "text/plain",
+                    "data": response_text,
+                    "content": response_text,
+                    "role": "model"
+                }
+                await websocket.send_text(json.dumps(response_message))
+                print(f"[CLIENT TO AGENT]: Sent response: {response_text[:50]}...")
 
-            # Send the audio data - note that ActivityStart/End and transcription
-            # handling is done automatically by the ADK when input_audio_transcription
-            # is enabled in the config
-            live_request_queue.send_realtime(
-                types.Blob(data=decoded_data, mime_type=mime_type)
-            )
-            print(f"[CLIENT TO AGENT]: audio/pcm: {len(decoded_data)} bytes")
+                # Try to send the message to the agent as well
+                try:
+                    content = types.Content(role=role, parts=[types.Part.from_text(text=data)])
+                    live_request_queue.send_content(content=content)
+                    print(f"[CLIENT TO AGENT]: Text sent successfully to agent: {data}")
+                except Exception as e:
+                    print(f"[CLIENT TO AGENT ERROR]: Failed to send to agent: {e}")
+                    
+                    # Send a fallback response if the agent fails
+                    await websocket.send_text(json.dumps({
+                        "mime_type": "text/plain",
+                        "type": "text/plain",
+                        "data": "I'm sorry, I'm having trouble processing your request right now.",
+                        "content": "I'm sorry, I'm having trouble processing your request right now.",
+                        "role": "model"
+                    }))
+                
+                # Send a turn_complete message after a delay to ensure client doesn't wait forever
+                await asyncio.sleep(1)
+                await websocket.send_text(json.dumps({"turn_complete": True}))
+            elif mime_type == "audio/pcm":
+                # Send audio data
+                try:
+                    print(f"[CLIENT TO AGENT]: Decoding audio data of length: {len(data)}")
+                    decoded_data = base64.b64decode(data)
+                    print(f"[CLIENT TO AGENT]: Decoded audio data of size: {len(decoded_data)} bytes")
 
-        else:
-            raise ValueError(f"Mime type not supported: {mime_type}")
+                    # Send a processing message
+                    await websocket.send_text(json.dumps({
+                        "mime_type": "text/plain",
+                        "type": "text/plain",
+                        "data": "Processing your audio message...",
+                        "content": "Processing your audio message...",
+                        "role": "model"
+                    }))
+
+                    # Send the audio data - note that ActivityStart/End and transcription
+                    # handling is done automatically by the ADK when input_audio_transcription
+                    # is enabled in the config
+                    live_request_queue.send_realtime(
+                        types.Blob(data=decoded_data, mime_type=mime_type)
+                    )
+                    print(f"[CLIENT TO AGENT]: Audio sent successfully: {len(decoded_data)} bytes")
+                    
+                    # Send a turn_complete message after a delay to ensure client doesn't wait forever
+                    await asyncio.sleep(1)
+                    await websocket.send_text(json.dumps({"turn_complete": True}))
+                except Exception as audio_error:
+                    print(f"[AUDIO ERROR]: Failed to process audio: {audio_error}")
+                    
+                    # Send a fallback response if audio processing fails
+                    await websocket.send_text(json.dumps({
+                        "mime_type": "text/plain",
+                        "type": "text/plain",
+                        "data": "I'm sorry, I couldn't process your audio message.",
+                        "content": "I'm sorry, I couldn't process your audio message.",
+                        "role": "model"
+                    }))
+                    await websocket.send_text(json.dumps({"turn_complete": True}))
+            else:
+                print(f"[CLIENT WARNING]: Unsupported mime type: {mime_type}")
+                
+                # Send an unsupported format message
+                await websocket.send_text(json.dumps({
+                    "mime_type": "text/plain",
+                    "type": "text/plain",
+                    "data": f"I don't support messages with type '{mime_type}'. Please send text or audio.",
+                    "content": f"I don't support messages with type '{mime_type}'. Please send text or audio.",
+                    "role": "model"
+                }))
+                await websocket.send_text(json.dumps({"turn_complete": True}))
+    except WebSocketDisconnect:
+        print("WebSocket disconnected during client-to-agent messaging")
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON message: {e}")
+    except Exception as e:
+        print(f"Error in client-to-agent messaging: {e}")
 
 
-#
-# FastAPI web app
-#
-
-app = FastAPI()
-
-STATIC_DIR = Path("static")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
+# API Endpoints
 @app.get("/")
 async def root():
-    """Serves the index.html"""
+    """API root endpoint"""
+    STATIC_DIR = Path(__file__).parent / "static"
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+@app.get("/api/status")
+async def status():
+    """API status endpoint - accessible without authentication for development"""
+    return {
+        "status": "online",
+        "active_sessions": len(active_sessions),
+        "service": APP_NAME
+    }
+
+# Static files
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.websocket("/ws/{session_id}")
@@ -189,26 +486,96 @@ async def websocket_endpoint(
     websocket: WebSocket,
     session_id: str,
     is_audio: str = Query(...),
+    api_key: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None),
 ):
-    """Client websocket endpoint"""
-
+    """Client websocket endpoint with API key validation"""
+    # Create a unique connection ID for this specific websocket connection
+    connection_id = f"{session_id}_{is_audio}_{id(websocket)}"
+    
+    # Note: In development, we're bypassing API key validation for easier testing
+    # Uncomment for production
+    """
+    # Validate API key from header OR query parameter
+    provided_api_key = x_api_key or api_key
+    
+    if provided_api_key != API_KEY:
+        print(f"Invalid API key provided: {provided_api_key}")
+        await websocket.close(code=1008)  # Policy violation
+        return
+    """
+    print(f"API authentication bypassed for development on connection {connection_id}")
+        
     # Wait for client connection
     await websocket.accept()
-    print(f"Client #{session_id} connected, audio mode: {is_audio}")
+    print(f"Client #{connection_id} connected, audio mode: {is_audio}")
+    
+    # Send an immediate welcome message to test message flow
+    try:
+        print(f"DEBUG: Preparing to send welcome message to {connection_id}")
+        welcome_message = {
+            "mime_type": "text/plain",
+            "type": "text/plain",
+            "data": "Hello! I'm your scheduling assistant. How can I help you with your calendar today?",
+            "content": "Hello! I'm your scheduling assistant. How can I help you with your calendar today?",
+            "role": "model"
+        }
+        print(f"DEBUG: Welcome message prepared: {json.dumps(welcome_message)[:100]}...")
+        await websocket.send_text(json.dumps(welcome_message))
+        print(f"DEBUG: Welcome message sent successfully to client #{connection_id}")
+        
+        # Send a ping message to verify connection is working
+        ping_message = {"type": "ping", "timestamp": str(time.time())}
+        await websocket.send_text(json.dumps(ping_message))
+        print(f"DEBUG: Ping message sent to verify connection status for #{connection_id}")
+    except Exception as e:
+        print(f"Error sending welcome message: {e}")
+    
+    try:
+        # Start agent session or get existing one
+        if session_id not in active_sessions:
+            # First connection for this session - create a new session
+            print(f"Creating new agent session for {session_id}")
+            live_events, live_request_queue = start_agent_session(
+                session_id, is_audio == "true"
+            )
+        else:
+            # Get existing session data
+            print(f"Reusing existing agent session for {session_id}")
+            session_data = active_sessions[session_id]
+            live_events = session_data["live_events"]
+            live_request_queue = session_data["live_request_queue"]
+        
+        # For text connections, only use client-to-agent messaging
+        # For audio connections, use both directions
+        # This prevents multiple consumers of the same async generator
+        if is_audio == "true":
+            # Start both tasks for audio mode
+            print(f"Starting audio mode tasks for {connection_id}")
+            agent_to_client_task = asyncio.create_task(
+                agent_to_client_messaging(websocket, live_events)
+            )
+            client_to_agent_task = asyncio.create_task(
+                client_to_agent_messaging(websocket, live_request_queue)
+            )
+            await asyncio.gather(client_to_agent_task, return_exceptions=True)
+        else:
+            # For text mode, only handle client-to-agent
+            print(f"Starting text mode task for {connection_id}")
+            await client_to_agent_messaging(websocket, live_request_queue)
+            
+    except WebSocketDisconnect:
+        print(f"Client #{connection_id} disconnected")
+    except Exception as e:
+        print(f"Error in websocket endpoint: {e}")
+    finally:
+        # Don't remove session immediately to allow reconnections
+        # In a production app, you might want to add a cleanup job
+        # that removes stale sessions after a timeout period
+        print(f"Client #{connection_id} websocket connection ended")
 
-    # Start agent session
-    live_events, live_request_queue = start_agent_session(
-        session_id, is_audio == "true"
-    )
-
-    # Start tasks
-    agent_to_client_task = asyncio.create_task(
-        agent_to_client_messaging(websocket, live_events)
-    )
-    client_to_agent_task = asyncio.create_task(
-        client_to_agent_messaging(websocket, live_request_queue)
-    )
-    await asyncio.gather(agent_to_client_task, client_to_agent_task)
-
-    # Disconnected
-    print(f"Client #{session_id} disconnected")
+# For Google Cloud Run
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8081))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)

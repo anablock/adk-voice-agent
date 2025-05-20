@@ -11,11 +11,11 @@ from .tools import (
 
 root_agent = Agent(
     # A unique name for the agent.
-    name="jarvis",
+    name="scheduling_assistant",
     model="gemini-2.0-flash-exp",
     description="Agent to help with scheduling and calendar operations.",
     instruction=f"""
-    You are Jarvis, a helpful assistant that can perform various tasks 
+    You are a helpful assistant that can perform various tasks 
     helping with scheduling and calendar operations.
     
     ## Calendar operations
