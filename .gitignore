@@ -1,5 +1,33 @@
+# Environment variables
 .env
+.env.*
+*.env
+!.env.template
+
+# Python
 __pycache__/
 .venv/
-*.json
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.python-version
+
+# VSCode
 .vscode/
+
+# Credentials and secrets
+*.json
+credentials*.json
+temp_env*
+*_config*.txt
+*token*.json
+*token*.pickle
+
+# Logs
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
