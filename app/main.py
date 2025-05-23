@@ -28,11 +28,11 @@ APP_NAME = "ADK Streaming example"
 session_service = InMemorySessionService()
 
 
-def start_agent_session(session_id, is_audio=False):
+async def start_agent_session(session_id, is_audio=False):
     """Starts an agent session"""
 
     # Create a Session
-    session = session_service.create_session(
+    session = await session_service.create_session(
         app_name=APP_NAME,
         user_id=session_id,
         session_id=session_id,
@@ -197,7 +197,7 @@ async def websocket_endpoint(
     print(f"Client #{session_id} connected, audio mode: {is_audio}")
 
     # Start agent session
-    live_events, live_request_queue = start_agent_session(
+    live_events, live_request_queue = await start_agent_session(
         session_id, is_audio == "true"
     )
 
