@@ -8,7 +8,9 @@
 
 // Global variables
 const sessionId = Math.random().toString().substring(10);
-const ws_url = "ws://" + window.location.host + "/ws/" + sessionId;
+// Use secure WebSockets (wss://) when the page is loaded over HTTPS
+const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+const ws_url = protocol + window.location.host + "/ws/" + sessionId;
 let websocket = null;
 let is_audio = false;
 let currentMessageId = null; // Track the current message ID during a conversation turn
