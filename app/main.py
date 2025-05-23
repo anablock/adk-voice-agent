@@ -32,11 +32,19 @@ async def start_agent_session(session_id, is_audio=False):
     """Starts an agent session"""
 
     # Create a Session
-    session = await session_service.create_session(
+    # Handle both async and sync versions of create_session
+    session_result = session_service.create_session(
         app_name=APP_NAME,
         user_id=session_id,
         session_id=session_id,
     )
+    
+    # Check if the result is awaitable (coroutine)
+    if hasattr(session_result, '__await__'):
+        session = await session_result
+    else:
+        # Already a Session object
+        session = session_result
 
     # Create a Runner
     runner = Runner(
