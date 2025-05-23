@@ -2,6 +2,7 @@
 Utility functions for Google Calendar integration.
 """
 
+import base64
 import json
 import os
 from datetime import datetime
@@ -23,36 +24,77 @@ CREDENTIALS_PATH = Path("credentials.json")
 def get_calendar_service():
     """
     Authenticate and create a Google Calendar service object.
+    Supports both local token file and environment variable credential storage.
 
     Returns:
         A Google Calendar service object or None if authentication fails
     """
     creds = None
 
-    # Check if token exists and is valid
-    if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_info(
-            json.loads(TOKEN_PATH.read_text()), SCOPES
-        )
+    # Check if base64-encoded credentials exist in environment variable (for Heroku)
+    base64_creds = os.environ.get('CALENDAR_CREDENTIALS_BASE64')
+    
+    if base64_creds:
+        try:
+            # Decode base64 string to JSON
+            decoded_creds = base64.b64decode(base64_creds).decode('utf-8')
+            creds_json = json.loads(decoded_creds)
+            creds = Credentials.from_authorized_user_info(creds_json, SCOPES)
+            print("Using credentials from environment variable")
+        except Exception as e:
+            print(f"Error parsing credentials from environment: {e}")
+    
+    # If no environment credentials, check if token exists locally and is valid
+    if not creds and TOKEN_PATH.exists():
+        try:
+            creds = Credentials.from_authorized_user_info(
+                json.loads(TOKEN_PATH.read_text()), SCOPES
+            )
+            print("Using credentials from local token file")
+        except Exception as e:
+            print(f"Error loading token file: {e}")
 
     # If credentials don't exist or are invalid, refresh or get new ones
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # If credentials.json doesn't exist, we can't proceed with OAuth flow
-            if not CREDENTIALS_PATH.exists():
-                print(
-                    f"Error: {CREDENTIALS_PATH} not found. Please follow setup instructions."
-                )
+            try:
+                creds.refresh(Request())
+                print("Refreshed expired credentials")
+                
+                # If we're in a writable environment (not Heroku), save to file
+                if not base64_creds:
+                    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    TOKEN_PATH.write_text(creds.to_json())
+            except Exception as e:
+                print(f"Error refreshing credentials: {e}")
                 return None
+        else:
+            # Only try local OAuth flow if we're not on Heroku
+            if not os.environ.get('DYNO'):  # 'DYNO' is present on Heroku
+                # If credentials.json doesn't exist, we can't proceed with OAuth flow
+                if not CREDENTIALS_PATH.exists():
+                    print(
+                        f"Error: {CREDENTIALS_PATH} not found. Please follow setup instructions."
+                    )
+                    return None
 
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        # Save the credentials for the next run
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_PATH.write_text(creds.to_json())
+                try:
+                    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+                    creds = flow.run_local_server(port=0)
+                    
+                    # Save the credentials for the next run
+                    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    TOKEN_PATH.write_text(creds.to_json())
+                    
+                    # Output the base64 encoded credentials that can be used in Heroku
+                    print("\nFor Heroku deployment, add this to your environment variables:\n")
+                    print(f"CALENDAR_CREDENTIALS_BASE64={base64.b64encode(creds.to_json().encode()).decode()}\n")
+                except Exception as e:
+                    print(f"Error in OAuth flow: {e}")
+                    return None
+            else:
+                print("No valid credentials available. Cannot authenticate on Heroku without CALENDAR_CREDENTIALS_BASE64.")
+                return None
 
     # Create and return the Calendar service
     return build("calendar", "v3", credentials=creds)

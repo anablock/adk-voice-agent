@@ -156,3 +156,15 @@ If you encounter issues installing the required packages:
 - The OAuth token is stored securely in your user directory
 - Never share your `credentials.json` file or the generated token
 - The application only requests the minimum permissions needed for calendar operations
+
+
+## Create Calendar Credential Base64
+- once in the local system authenticate using run the command `python setup_calendar_auth.py`
+
+- then run the following command to get the base64 encoded token:
+
+```bash
+python -c "import base64, json; print('CALENDAR_CREDENTIALS_BASE64=' + base64.b64encode(open('$HOME/.credentials/calendar_token.json').read().encode()).decode())"
+```
+
+- copy the output and add it to your `.env` file
