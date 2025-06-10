@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .message-container {
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+        }
+        .control-panel {
+            margin-top: 20px;
+        }
+        .user-message {
+            background-color: #e6f7ff;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 5px;
+        }
+        .bot-message {
+            background-color: #f0f0f0;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 5px;
+        }
+        button {
+            padding: 8px 16px;
+            margin-right: 10px;
+        }
+        input {
+            padding: 8px;
+            width: 60%;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 5px;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+    </style>
+</head>
+<body>
+    <h1>ADK Voice Agent WebSocket Test</h1>
+    
+    <div class="status disconnected" id="status">Disconnected</div>
+    
+    <div class="control-panel">
+        <button id="connect-btn">Connect</button>
+        <button id="disconnect-btn" disabled>Disconnect</button>
+        <div style="margin-top: 10px;">
+            <label for="session-id">Session ID:</label>
+            <input type="text" id="session-id" value="" placeholder="Session ID (auto-generated)">
+        </div>
+        <div style="margin-top: 10px;">
+            <label for="api-key">API Key:</label>
+            <input type="text" id="api-key" value="development-key" placeholder="API Key">
+        </div>
+        <div style="margin-top: 10px;">
+            <label for="is-audio">Audio Mode:</label>
+            <input type="checkbox" id="is-audio"> Enable Audio Mode
+        </div>
+    </div>
+    
+    <div style="margin-top: 20px;">
+        <input type="text" id="message-input" placeholder="Type your message here..." disabled>
+        <button id="send-btn" disabled>Send</button>
+    </div>
+    
+    <div class="message-container" id="message-container"></div>
+    
+    <h3>Console Output</h3>
+    <pre id="console-output" style="background-color: #f5f5f5; padding: 10px; height: 150px; overflow-y: auto;"></pre>
+    
+    <script>
+        // Elements
+        const connectBtn = document.getElementById('connect-btn');
+        const disconnectBtn = document.getElementById('disconnect-btn');
+        const messageInput = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const messageContainer = document.getElementById('message-container');
+        const statusEl = document.getElementById('status');
+        const sessionIdInput = document.getElementById('session-id');
+        const apiKeyInput = document.getElementById('api-key');
+        const isAudioCheckbox = document.getElementById('is-audio');
+        const consoleOutput = document.getElementById('console-output');
+        
+        // Generate a random session ID
+        sessionIdInput.value = Math.random().toString(36).substring(2, 10);
+        
+        // WebSocket reference
+        let socket = null;
+        
+        // Log function (override console.log)
+        const originalConsoleLog = console.log;
+        const originalConsoleError = console.error;
+        
+        console.log = function() {
+            // Call the original console.log
+            originalConsoleLog.apply(console, arguments);
+            
+            // Format and display in our custom console
+            const args = Array.from(arguments);
+            const formattedMessage = args.map(arg => {
+                if (typeof arg === 'object') {
+                    return JSON.stringify(arg, null, 2);
+                }
+                return String(arg);
+            }).join(' ');
+            
+            consoleOutput.innerHTML += `<div>[LOG] ${formattedMessage}</div>`;
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+        };
+        
+        console.error = function() {
+            // Call the original console.error
+            originalConsoleError.apply(console, arguments);
+            
+            // Format and display in our custom console
+            const args = Array.from(arguments);
+            const formattedMessage = args.map(arg => {
+                if (typeof arg === 'object') {
+                    return JSON.stringify(arg, null, 2);
+                }
+                return String(arg);
+            }).join(' ');
+            
+            consoleOutput.innerHTML += `<div style="color: red;">[ERROR] ${formattedMessage}</div>`;
+            consoleOutput.scrollTop = consoleOutput.scrollHeight;
+        };
+        
+        // Connect to WebSocket
+        function connect() {
+            if (socket) {
+                console.log('Already connected, disconnecting first...');
+                socket.close();
+            }
+            
+            const sessionId = sessionIdInput.value || Math.random().toString(36).substring(2, 10);
+            const apiKey = apiKeyInput.value || 'development-key';
+            const isAudio = isAudioCheckbox.checked;
+            
+            // Update UI
+            statusEl.className = 'status connecting';
+            statusEl.textContent = 'Connecting...';
+            connectBtn.disabled = true;
+            
+            // Build WebSocket URL
+            const baseUrl = 'ws://localhost:8081/ws';
+            const audioParam = isAudio ? 'true' : 'false';
+            const wsUrl = `${baseUrl}/${sessionId}?is_audio=${audioParam}&api_key=${apiKey}`;
+            
+            console.log(`Connecting to: ${wsUrl}`);
+            
+            try {
+                // Create WebSocket
+                socket = new WebSocket(wsUrl);
+                
+                // Connection opened
+                socket.addEventListener('open', (event) => {
+                    console.log('Connected to WebSocket');
+                    
+                    // Update UI
+                    statusEl.className = 'status connected';
+                    statusEl.textContent = 'Connected';
+                    connectBtn.disabled = true;
+                    disconnectBtn.disabled = false;
+                    messageInput.disabled = false;
+                    sendBtn.disabled = false;
+                    
+                    // Send initial ping
+                    const pingMessage = {
+                        type: 'ping',
+                        api_key: apiKey
+                    };
+                    socket.send(JSON.stringify(pingMessage));
+                    console.log('Sent ping message');
+                });
+                
+                // Listen for messages
+                socket.addEventListener('message', (event) => {
+                    console.log('Message received:', event.data);
+                    
+                    try {
+                        // Parse the message
+                        const data = JSON.parse(event.data);
+                        
+                        // Handle different message types
+                        if (data.role === 'model' && data.content) {
+                            // Add message to the container
+                            addMessage(data.content, 'bot');
+                        } else if (data.turn_complete) {
+                            console.log('Turn complete received');
+                        } else {
+                            console.log('Other message type received:', data);
+                        }
+                    } catch (error) {
+                        console.error('Error parsing message:', error);
+                        console.log('Raw message:', event.data);
+                    }
+                });
+                
+                // Connection closed
+                socket.addEventListener('close', (event) => {
+                    console.log(`Connection closed: ${event.code} ${event.reason}`);
+                    
+                    // Update UI
+                    statusEl.className = 'status disconnected';
+                    statusEl.textContent = `Disconnected (Code: ${event.code})`;
+                    connectBtn.disabled = false;
+                    disconnectBtn.disabled = true;
+                    messageInput.disabled = true;
+                    sendBtn.disabled = true;
+                    
+                    // Clear socket reference
+                    socket = null;
+                });
+                
+                // Connection error
+                socket.addEventListener('error', (error) => {
+                    console.error('WebSocket error:', error);
+                    
+                    // Update UI
+                    statusEl.className = 'status disconnected';
+                    statusEl.textContent = 'Connection Error';
+                });
+                
+            } catch (error) {
+                console.error('Error creating WebSocket:', error);
+                
+                // Update UI
+                statusEl.className = 'status disconnected';
+                statusEl.textContent = 'Connection Failed';
+                connectBtn.disabled = false;
+            }
+        }
+        
+        // Disconnect from WebSocket
+        function disconnect() {
+            if (socket) {
+                socket.close();
+                
+                // Update UI
+                statusEl.className = 'status disconnected';
+                statusEl.textContent = 'Disconnected';
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                messageInput.disabled = true;
+                sendBtn.disabled = true;
+                
+                // Clear socket reference
+                socket = null;
+            }
+        }
+        
+        // Send a message
+        function sendMessage() {
+            if (!socket) {
+                console.error('Not connected to WebSocket');
+                return;
+            }
+            
+            const message = messageInput.value.trim();
+            if (!message) {
+                return;
+            }
+            
+            // Add message to the container
+            addMessage(message, 'user');
+            
+            // Create message object
+            const messageObj = {
+                mime_type: 'text/plain',
+                data: message,
+                role: 'user'
+            };
+            
+            // Send message
+            socket.send(JSON.stringify(messageObj));
+            console.log('Message sent:', message);
+            
+            // Clear input
+            messageInput.value = '';
+        }
+        
+        // Add a message to the container
+        function addMessage(text, sender) {
+            const messageEl = document.createElement('div');
+            messageEl.className = sender === 'user' ? 'user-message' : 'bot-message';
+            messageEl.textContent = text;
+            
+            messageContainer.appendChild(messageEl);
+            messageContainer.scrollTop = messageContainer.scrollHeight;
+        }
+        
+        // Event listeners
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        sendBtn.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>

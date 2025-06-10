@@ -29,7 +29,7 @@ from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.genai import types
 from starlette.status import HTTP_401_UNAUTHORIZED
 
-from app.jarvis.agent import root_agent
+from jarvis.agent import root_agent
 
 # Load environment variables
 load_dotenv()

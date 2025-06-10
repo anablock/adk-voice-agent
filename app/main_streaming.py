@@ -128,7 +128,8 @@ class SessionManager:
             self.audio_state[connection_id] = {
                 "is_speaking": False,
                 "last_chunk_time": 0,
-                "silence_threshold_ms": 1000,  # 1 second of silence to consider speech ended
+                "silence_threshold_ms": 1500,  # 1.5 seconds of silence to consider speech ended
+                "min_speech_chunks": 10,      # Minimum chunks needed to consider valid speech
                 "chunks_count": 0,
                 "total_bytes": 0
             }
@@ -174,10 +175,21 @@ class SessionManager:
             self.audio_state[connection_id]["chunks_count"] += 1
             self.audio_state[connection_id]["total_bytes"] += audio_data_length
             
-            # Mark as speaking
+            # Mark as speaking only if we exceed minimum threshold of audio data
             if audio_data_length > 0:
-                self.audio_state[connection_id]["is_speaking"] = True
-                print(f"[AUDIO]: Speaking detected for {connection_id}, chunks: {self.audio_state[connection_id]['chunks_count']}")
+                # Get minimum chunks needed to consider this actual speech
+                min_chunks = self.audio_state[connection_id].get("min_speech_chunks", 10)
+                
+                # Only mark as speaking once we have enough chunks
+                if self.audio_state[connection_id]["chunks_count"] >= min_chunks:
+                    if not self.audio_state[connection_id]["is_speaking"]:
+                        print(f"[AUDIO]: Speech detected for {connection_id} after {self.audio_state[connection_id]['chunks_count']} chunks")
+                    self.audio_state[connection_id]["is_speaking"] = True
+                else:
+                    print(f"[AUDIO]: Building speech for {connection_id}, chunks: {self.audio_state[connection_id]['chunks_count']}/{min_chunks}")
+                    
+                # Still log the incoming chunks either way
+                print(f"[AUDIO]: Audio chunk received for {connection_id}, size: {audio_data_length} bytes")
 
     async def check_for_silence(self, connection_id, live_request_queue):
         """Check if silence has been detected and send end marker if needed"""
@@ -194,6 +206,37 @@ class SessionManager:
                 
                 # Send the end marker
                 live_request_queue.send_realtime(types.Blob(data=b"", mime_type="audio/pcm"))
+                
+                # Also send an explicit end of audio marker with a meaningful text
+                # This helps the LLM understand this is complete audio and not to guess at partial input
+                try:
+                    # Use a simpler approach to send a text message directly
+                    # The API expects content to be sent with parts, but let's
+                    # avoid using Part.from_text which seems to have changed API
+                    
+                    # Create a text part using dictionary format which is more stable
+                    text_part = {"text": "[END_OF_AUDIO_INPUT]"}
+                    
+                    # Send content with text part as a dictionary
+                    live_request_queue.send_content(
+                        types.Content(
+                            role="user",
+                            parts=[text_part]
+                        )
+                    )
+                    print(f"[SILENCE]: Successfully sent end-of-audio marker for {connection_id}")
+                except Exception as e:
+                    print(f"[SILENCE]: Error in silence checker: {e}")
+                    # Try simpler content format without wrapping in Part
+                    try:
+                        content = types.Content(role="user")
+                        content.parts = [{"text": "[END_OF_AUDIO_INPUT]"}]
+                        live_request_queue.send_content(content)
+                        print(f"[SILENCE]: Used fallback 1 to send end-of-audio marker for {connection_id}")
+                    except Exception as e2:
+                        print(f"[SILENCE]: All fallbacks failed: {e2}")
+                        print(f"[SILENCE]: Will continue processing but transcription may be incomplete")
+                
                 
                 # Reset speaking state
                 state["is_speaking"] = False
@@ -268,6 +311,17 @@ async def status():
         "status": "online",
         "has_gemini_key": has_gemini_key,
         "has_calendar_credentials": has_calendar_creds,
+    }
+
+
+# Health check endpoint for the voice assistant frontend
+@app.get("/health")
+async def health_check():
+    """Simple health check endpoint for the voice assistant frontend"""
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "service": APP_NAME
     }
 
 

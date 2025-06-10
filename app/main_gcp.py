@@ -20,8 +20,31 @@ from starlette.status import HTTP_401_UNAUTHORIZED
 
 from app.jarvis.agent import root_agent
 
-# Load environment variables
-load_dotenv()
+# Load environment variables - only load .env file in development
+if os.path.exists(".env"):
+    load_dotenv()
+    print("Loaded .env file (development environment)")
+else:
+    print("No .env file found (production environment)")
+    
+# Check for credentials.json in various locations
+credentials_locations = [
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), 'credentials.json'),
+    '/secrets/credentials.json',
+    '/secrets/google-calendar-credentials'
+]
+
+credentials_path = None
+for loc in credentials_locations:
+    if os.path.exists(loc):
+        credentials_path = loc
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials_path
+        print(f"Set GOOGLE_APPLICATION_CREDENTIALS to: {credentials_path}")
+        break
+        
+if not credentials_path:
+    print("Warning: credentials.json not found in any expected location")
+
 
 APP_NAME = "ADK Voice Agent"
 session_service = InMemorySessionService()
